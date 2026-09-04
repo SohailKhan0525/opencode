@@ -1,10 +1,11 @@
 import type { Hooks, PluginInput } from "@opencode-ai/plugin"
 import { OAUTH_DUMMY_KEY } from "../../auth"
-import { spawn } from "node:child_process"
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process"
 
 const AGY = process.platform === "win32" ? "agy.exe" : "agy"
 const AGY_DOCS = "https://antigravity.google/docs/cli/install"
 const AUTH_MARKER = "antigravity-cli"
+const sessions = new Map<string, AgySession>()
 
 function commandExists(): Promise<boolean> {
   return new Promise((resolve) => {
@@ -14,58 +15,12 @@ function commandExists(): Promise<boolean> {
   })
 }
 
-function runAgy(args: string[], cwd: string, inherit = false): Promise<{ code: number; stdout: string; stderr: string }> {
+function runAgyInteractive(cwd: string): Promise<number> {
   return new Promise((resolve, reject) => {
-    const child = spawn(AGY, args, {
-      cwd,
-      stdio: inherit ? "inherit" : ["ignore", "pipe", "pipe"],
-      windowsHide: true,
-    })
-
-    if (inherit) {
-      child.once("error", reject)
-      child.once("exit", (code) => resolve({ code: code ?? 1, stdout: "", stderr: "" }))
-      return
-    }
-
-    let stdout = ""
-    let stderr = ""
-    child.stdout?.on("data", (chunk) => (stdout += String(chunk)))
-    child.stderr?.on("data", (chunk) => (stderr += String(chunk)))
+    const child = spawn(AGY, [], { cwd, stdio: "inherit", windowsHide: true })
     child.once("error", reject)
-    child.once("exit", (code) => resolve({ code: code ?? 1, stdout, stderr }))
+    child.once("exit", (code) => resolve(code ?? 1))
   })
-}
-
-async function isAuthenticated(cwd: string) {
-  if (!(await commandExists())) return false
-  try {
-    const result = await runAgy(["-p", "Reply with exactly: OK", "--output-format", "json", "--print-timeout", "30s"], cwd)
-    if (result.code !== 0) return false
-    try {
-      const parsed = JSON.parse(result.stdout) as { status?: string }
-      return parsed.status === "SUCCESS"
-    } catch {
-      return false
-    }
-  } catch {
-    return false
-  }
-}
-
-async function ensureAuthenticated(cwd: string) {
-  if (!(await commandExists())) {
-    throw new Error("Antigravity CLI (agy) is not installed. Install it from https://antigravity.google/docs/cli/install")
-  }
-
-  if (await isAuthenticated(cwd)) return
-
-  // Google documents browser-based sign-in as part of the normal local `agy` flow.
-  // Run the official CLI interactively so Google owns the OAuth/keyring exchange.
-  const result = await runAgy([], cwd, true)
-  if (result.code !== 0 || !(await isAuthenticated(cwd))) {
-    throw new Error("Antigravity sign-in did not complete. Run `agy` once, finish Google Sign-In, then retry.")
-  }
 }
 
 function textFromPart(part: any): string {
@@ -75,19 +30,20 @@ function textFromPart(part: any): string {
   return ""
 }
 
-function contentsToPrompt(body: any): string {
-  const sections: string[] = []
-
-  const system = body?.systemInstruction?.parts?.map(textFromPart).filter(Boolean).join("\n")
-  if (system) sections.push(`SYSTEM:\n${system}`)
-
-  for (const content of Array.isArray(body?.contents) ? body.contents : []) {
-    const role = content?.role === "model" ? "ASSISTANT" : "USER"
+function latestUserPrompt(body: any): string {
+  const contents = Array.isArray(body?.contents) ? body.contents : []
+  for (let i = contents.length - 1; i >= 0; i--) {
+    const content = contents[i]
+    if (content?.role !== "user") continue
     const text = Array.isArray(content?.parts) ? content.parts.map(textFromPart).filter(Boolean).join("\n") : ""
-    if (text) sections.push(`${role}:\n${text}`)
+    if (text) return text
   }
+  return "Continue the task in the current workspace."
+}
 
-  return sections.join("\n\n") || "USER:\nContinue the task in the current workspace."
+function systemPrompt(body: any): string {
+  const system = body?.systemInstruction?.parts?.map(textFromPart).filter(Boolean).join("\n")
+  return system || ""
 }
 
 function extractModel(url: URL): string | undefined {
@@ -99,29 +55,195 @@ function googleResponse(text: string) {
   return {
     candidates: [
       {
-        content: {
-          role: "model",
-          parts: [{ text }],
-        },
+        content: { role: "model", parts: [{ text }] },
         finishReason: "STOP",
       },
     ],
   }
 }
 
-function sseResponse(text: string) {
-  const payload = JSON.stringify(googleResponse(text))
-  const body = `data: ${payload}\n\n`
-  return new Response(body, {
-    status: 200,
-    headers: {
-      "content-type": "text/event-stream",
-      "cache-control": "no-cache",
-    },
-  })
+function sseChunk(text: string): string {
+  return `data: ${JSON.stringify(googleResponse(text))}\n\n`
 }
 
-async function executeAgent(input: PluginInput, url: URL, init?: RequestInit): Promise<Response> {
+type PendingTurn = {
+  prompt: string
+  model?: string
+  onDelta?: (text: string) => void
+  resolve: (text: string) => void
+  reject: (error: Error) => void
+}
+
+class AgySession {
+  private child?: ChildProcessWithoutNullStreams
+  private buffer = ""
+  private queue: PendingTurn[] = []
+  private active?: PendingTurn
+  private activeText = ""
+  private authenticated = false
+  private firstSystem = ""
+
+  constructor(private readonly cwd: string) {}
+
+  private start() {
+    if (this.child) return
+
+    const child = spawn(AGY, ["--input-format", "stream-json", "--output-format", "stream-json"], {
+      cwd: this.cwd,
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+    })
+    this.child = child
+
+    child.stdout.on("data", (chunk) => this.onStdout(String(chunk)))
+    child.stderr.on("data", (chunk) => {
+      const message = String(chunk).trim()
+      if (message) this.lastStderr = message
+    })
+    child.once("error", (error) => this.fail(new Error(`Antigravity CLI failed to start: ${error.message}`)))
+    child.once("exit", (code) => {
+      this.child = undefined
+      if (this.active) this.fail(new Error(this.lastStderr || `Antigravity CLI exited with code ${code ?? 1}`))
+      else if (this.queue.length) this.fail(new Error(this.lastStderr || "Antigravity CLI exited unexpectedly"))
+    })
+  }
+
+  private lastStderr = ""
+
+  private onStdout(chunk: string) {
+    this.buffer += chunk
+    while (true) {
+      const newline = this.buffer.indexOf("\n")
+      if (newline < 0) return
+      const line = this.buffer.slice(0, newline).trim()
+      this.buffer = this.buffer.slice(newline + 1)
+      if (!line) continue
+
+      let event: any
+      try {
+        event = JSON.parse(line)
+      } catch {
+        continue
+      }
+
+      if (event.event === "init") {
+        this.authenticated = true
+        continue
+      }
+
+      if (event.event === "step_update") {
+        const update = event.step_update
+        const delta = typeof update?.text_delta === "string" ? update.text_delta : ""
+        if (delta) {
+          this.activeText += delta
+          this.active?.onDelta?.(delta)
+        }
+        continue
+      }
+
+      if (event.event === "result") {
+        const result = event.result ?? {}
+        const active = this.active
+        this.active = undefined
+        this.activeText = ""
+        if (!active) continue
+
+        if (result.status !== "SUCCESS") {
+          active.reject(new Error(result.error || "Antigravity agent request failed"))
+        } else {
+          const response = typeof result.response === "string" ? result.response : ""
+          active.resolve(response)
+        }
+        this.startNext()
+      }
+    }
+  }
+
+  private fail(error: Error) {
+    const active = this.active
+    this.active = undefined
+    this.activeText = ""
+    active?.reject(error)
+    for (const item of this.queue.splice(0)) item.reject(error)
+    this.child = undefined
+  }
+
+  private startNext() {
+    if (this.active || this.queue.length === 0) return
+    this.start()
+    const next = this.queue.shift()!
+    this.active = next
+    this.activeText = ""
+    const message = {
+      event: "user",
+      message: { content: next.prompt },
+    }
+    try {
+      this.child!.stdin.write(`${JSON.stringify(message)}\n`)
+    } catch (error) {
+      this.active = undefined
+      next.reject(error instanceof Error ? error : new Error(String(error)))
+      this.startNext()
+    }
+  }
+
+  async send(prompt: string, model?: string, onDelta?: (text: string) => void): Promise<string> {
+    this.start()
+    return new Promise((resolve, reject) => {
+      this.queue.push({ prompt, model, onDelta, resolve, reject })
+      this.startNext()
+    })
+  }
+
+  async ensureReady() {
+    this.start()
+    // The official streaming protocol emits init once the process is ready.
+    // Do not send a model request merely to probe authentication; the first real
+    // request will return Google's authentication-required error if needed.
+    for (let i = 0; i < 100 && !this.authenticated; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 25))
+      if (!this.child) break
+    }
+  }
+
+  close() {
+    try {
+      this.child?.stdin.end()
+    } catch {}
+    try {
+      this.child?.kill()
+    } catch {}
+    this.child = undefined
+    this.queue.splice(0).forEach((item) => item.reject(new Error("Antigravity session closed")))
+    if (this.active) {
+      this.active.reject(new Error("Antigravity session closed"))
+      this.active = undefined
+    }
+  }
+}
+
+function getSession(cwd: string): AgySession {
+  let session = sessions.get(cwd)
+  if (!session) {
+    session = new AgySession(cwd)
+    sessions.set(cwd, session)
+  }
+  return session
+}
+
+async function ensureAuthenticated(cwd: string) {
+  if (!(await commandExists())) {
+    throw new Error(`Antigravity CLI (agy) is not installed. Install it from ${AGY_DOCS}`)
+  }
+
+  // Let the official CLI own the Google browser OAuth/keyring exchange.
+  // If a cached account exists, agy returns immediately; otherwise it opens
+  // Google's browser sign-in flow in the user's normal terminal session.
+  const code = await runAgyInteractive(cwd)
+  if (code !== 0) throw new Error("Antigravity Google sign-in did not complete")
+}
+
+async function executeAgent(input: PluginInput, url: URL, init: RequestInit | undefined): Promise<Response> {
   const rawBody = typeof init?.body === "string" ? init.body : "{}"
   let body: any
   try {
@@ -133,34 +255,55 @@ async function executeAgent(input: PluginInput, url: URL, init?: RequestInit): P
     })
   }
 
-  await ensureAuthenticated(input.directory)
+  const session = getSession(input.directory)
+  const system = systemPrompt(body)
+  const prompt = system && !session["firstSystem"] ? `SYSTEM:\n${system}\n\n${latestUserPrompt(body)}` : latestUserPrompt(body)
+  if (system && !session["firstSystem"]) session["firstSystem"] = system
 
-  const prompt = contentsToPrompt(body)
   const model = extractModel(url)
-  const args = ["-p", prompt, "--output-format", "json", "--print-timeout", "10m"]
-  if (model) args.push("--model", model)
+  const wantsStream = /streamGenerateContent/.test(url.pathname) || new URLSearchParams(url.search).get("alt") === "sse"
 
-  const result = await runAgy(args, input.directory)
-  let parsed: any
-  try {
-    parsed = JSON.parse(result.stdout)
-  } catch {
-    parsed = undefined
-  }
-
-  if (result.code !== 0 || parsed?.status !== "SUCCESS") {
-    const message = parsed?.error || result.stderr.trim() || `agy exited with code ${result.code}`
-    return new Response(JSON.stringify({ error: { message } }), {
-      status: 502,
+  if (!wantsStream) {
+    const text = await session.send(prompt, model)
+    return new Response(JSON.stringify(googleResponse(text)), {
+      status: 200,
       headers: { "content-type": "application/json" },
     })
   }
 
-  const text = typeof parsed.response === "string" ? parsed.response : ""
-  const wantsStream = /streamGenerateContent/.test(url.pathname) || new URLSearchParams(url.search).get("alt") === "sse"
-  return wantsStream ? sseResponse(text) : new Response(JSON.stringify(googleResponse(text)), {
+  const encoder = new TextEncoder()
+  let controllerRef: ReadableStreamDefaultController<Uint8Array> | undefined
+  let streamed = false
+  let failure: Error | undefined
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controllerRef = controller
+      session
+        .send(prompt, model, (delta) => {
+          streamed = true
+          controller.enqueue(encoder.encode(sseChunk(delta)))
+        })
+        .then((text) => {
+          if (!streamed && text) controller.enqueue(encoder.encode(sseChunk(text)))
+          controller.enqueue(encoder.encode("data: [DONE]\n\n"))
+          controller.close()
+        })
+        .catch((error) => {
+          failure = error instanceof Error ? error : new Error(String(error))
+          controllerRef?.enqueue(encoder.encode(`data: ${JSON.stringify({ error: { message: failure.message } })}\n\n`))
+          controllerRef?.close()
+        })
+    },
+    cancel() {},
+  })
+
+  return new Response(stream, {
     status: 200,
-    headers: { "content-type": "application/json" },
+    headers: {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache",
+      connection: "keep-alive",
+    },
   })
 }
 
@@ -176,7 +319,7 @@ export async function AntigravityAuthPlugin(input: PluginInput): Promise<Hooks> 
             if (!(await commandExists())) {
               return {
                 url: AGY_DOCS,
-                instructions: "Install Antigravity CLI (`agy`) first, then retry Google / Antigravity login.",
+                instructions: `Install Antigravity CLI (agy) first: ${AGY_DOCS}`,
                 method: "auto",
                 callback: async () => ({ type: "failed" as const }),
               }
@@ -185,11 +328,12 @@ export async function AntigravityAuthPlugin(input: PluginInput): Promise<Hooks> 
             return {
               url: AGY_DOCS,
               instructions:
-                "Antigravity CLI will use Google's official browser sign-in and secure OS keyring. Finish Google Sign-In, then return to OpenCode.",
+                "Open Antigravity CLI once in this terminal. It will use Google's official browser sign-in and secure OS keyring. After sign-in, return to OpenCode.",
               method: "auto",
               callback: async () => {
                 try {
                   await ensureAuthenticated(input.directory)
+                  await getSession(input.directory).ensureReady()
                   return { type: "success" as const, provider: "google", key: AUTH_MARKER }
                 } catch {
                   return { type: "failed" as const }
