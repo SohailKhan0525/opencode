@@ -10,6 +10,7 @@ import { Config } from "@/config/config"
 import { createOpencodeClient } from "@opencode-ai/sdk"
 import { ServerAuth } from "@/server/auth"
 import { CodexAuthPlugin } from "./openai/codex"
+import { AntigravityAuthPlugin } from "./google/antigravity"
 import { Session } from "@/session/session"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { CopilotAuthPlugin } from "./github-copilot/copilot"
@@ -71,6 +72,7 @@ function internalPlugins(flags: RuntimeFlags.Info): PluginInstance[] {
       CodexAuthPlugin(input, {
         experimentalWebSockets: experimentalWebSocketsEnabled({ enabled: flags.experimentalWebSockets }),
       }),
+    AntigravityAuthPlugin,
     CopilotAuthPlugin,
     ModalPlugin,
     GitlabAuthPlugin,
