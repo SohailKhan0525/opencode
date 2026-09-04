@@ -257,10 +257,9 @@ async function executeAgent(input: PluginInput, url: URL, init: RequestInit | un
   const model = extractModel(url)
   const session = getSession(input.directory, model)
   const system = systemPrompt(body)
-  if (system && !session.firstSystem) session.firstSystem = system
-  const prompt = system && session.firstSystem === system
-    ? `SYSTEM:\n${system}\n\n${latestUserPrompt(body)}`
-    : latestUserPrompt(body)
+  const isFirstTurn = !session.firstSystem
+  if (system && isFirstTurn) session.firstSystem = system
+  const prompt = system && isFirstTurn ? `SYSTEM:\n${system}\n\n${latestUserPrompt(body)}` : latestUserPrompt(body)
 
   const wantsStream = /streamGenerateContent/.test(url.pathname) || new URLSearchParams(url.search).get("alt") === "sse"
 
